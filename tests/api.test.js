@@ -1,0 +1,18 @@
+import {test,afterEach} from 'node:test';
+import assert from 'node:assert/strict';
+import answer from '../api/answer.js';
+import transcribe from '../api/transcribe.js';
+const originalFetch=globalThis.fetch;
+const oldKey=process.env.GROQ_API_KEY,oldToken=process.env.APP_ACCESS_TOKEN;
+afterEach(()=>{globalThis.fetch=originalFetch;for(const [key,value] of [['GROQ_API_KEY',oldKey],['APP_ACCESS_TOKEN',oldToken]]){if(value===undefined)delete process.env[key];else process.env[key]=value;}});
+function config(){process.env.GROQ_API_KEY='test-key';process.env.APP_ACCESS_TOKEN='test-password';}
+function request(body,token='test-password'){return {method:'POST',body,headers:{authorization:`Bearer ${token}`}};}
+function response(){return {code:200,headers:{},setHeader(k,v){this.headers[k]=v;},status(code){this.code=code;return this;},json(data){this.body=data;}};}
+test('missing provider configuration is an actionable 503',async()=>{delete process.env.GROQ_API_KEY;delete process.env.APP_ACCESS_TOKEN;const res=response();await answer(request({question:'Why?'}),res);assert.equal(res.code,503);assert.match(res.body.error,/GROQ_API_KEY/);});
+test('wrong password never calls the provider',async()=>{config();globalThis.fetch=()=>{throw Error('Must not call provider');};const res=response();await answer(request({question:'Why?'},'wrong'),res);assert.equal(res.code,401);});
+test('rejects unsupported methods and excessive context',async()=>{config();const res=response();await answer({...request({}),method:'GET'},res);assert.equal(res.code,405);const other=response();await answer(request({question:'Q',resume:'x'.repeat(16001)}),other);assert.equal(other.code,400);});
+test('answer request passes real question and context to provider and returns output',async()=>{config();globalThis.fetch=async(url,options)=>{assert.equal(url,'https://api.groq.com/openai/v1/chat/completions');const data=JSON.parse(options.body);assert.match(data.messages[1].content,/React/);assert.match(data.messages[1].content,/Explain closures/);assert.equal(options.headers.Authorization,'Bearer test-key');return new Response(JSON.stringify({choices:[{message:{content:'A closure retains its lexical environment.'}}]}));};const res=response();await answer(request({question:'Explain closures',resume:'React developer',style:'detailed'}),res);assert.equal(res.code,200);assert.match(res.body.answer,/lexical/);assert.equal(res.headers['Cache-Control'],'no-store');});
+test('provider rate limits are distinguished from success',async()=>{config();globalThis.fetch=async()=>new Response('{}',{status:429});const res=response();await answer(request({question:'Why?'}),res);assert.equal(res.code,429);assert.match(res.body.error,/quota/);});
+test('empty provider result is rejected',async()=>{config();globalThis.fetch=async()=>new Response('{}');const res=response();await answer(request({question:'Why?'}),res);assert.equal(res.code,502);});
+test('audio is sent as a multipart file, not a chat prompt',async()=>{config();globalThis.fetch=async(url,options)=>{assert.match(url,/audio\/transcriptions$/);assert.equal(options.body.get('model'),'whisper-large-v3-turbo');assert.equal(options.body.get('file').type,'audio/webm');assert.equal(options.body.get('file').size,40);return new Response(JSON.stringify({text:'Explain dependency injection.'}));};const res=response();await transcribe(request({audio:Buffer.alloc(40).toString('base64'),mimeType:'audio/webm'}),res);assert.equal(res.code,200);assert.match(res.body.text,/dependency/);});
+test('unsupported audio is rejected before provider request',async()=>{config();const res=response();await transcribe(request({audio:'a'.repeat(100),mimeType:'video/mp4'}),res);assert.equal(res.code,400);});
